@@ -1,268 +1,188 @@
-# AlwaysOn — Autonomous Infrastructure Recovery
+# AlwaysOn: Autonomous Infrastructure Recovery Platform
 
-> An autonomous platform that detects failures, mirrors environments, fails over across regions and recovers critical services, so your systems stay up even when no one is awake to fix them.
+> Autonomous infrastructure recovery and failover.
 
-![status](https://img.shields.io/badge/status-in%20development-yellow)
-![license](https://img.shields.io/badge/license-MIT-blue)
-![version](https://img.shields.io/badge/version-0.1.0-green)
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Features](#features)
-- [How It Works](#how-it-works)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Safety Guardrails](#safety-guardrails)
-- [Use Cases](#use-cases)
-- [Project Structure](#project-structure)
-- [Integrations](#integrations)
-- [Works Well with InfraTwin](#works-well-with-infratwin)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [License](#license)
+> 🔒 **Proprietary and confidential software.** All rights reserved.
+> Access to this repository does not grant any right to copy, distribute, modify or use the code without prior written permission from the author.
 
 ---
 
-## Overview
+## What it does
 
-**AlwaysOn** closes the gap between *"something broke"* and *"service restored."* It continuously watches the availability of your critical services, decides on the right recovery action according to policies you define, and executes it automatically: restarting a workload, promoting a replica, or shifting traffic to a healthy region.
+- **Continuous health checking** of every endpoint (HTTP, TCP or shell command), with failure/success thresholds to avoid reacting to single blips.
+- **Autonomous recovery:** runs your recovery actions on unhealthy endpoints, with backoff, a maximum number of attempts and a cooldown.
+- **Automatic failover:** when the active endpoint goes down, traffic is moved to the healthiest endpoint by priority.
+- **Failback:** return to the preferred endpoint automatically (after it has been stable for a while) or manually.
+- **Flap protection:** if too many switches happen in a short window, automation freezes and waits for an operator.
+- **Switch hooks:** commands and webhooks that actually move the traffic (DNS, load balancer, ...), retried when they fail.
+- **Admin API and metrics:** status, events, Prometheus metrics and token-protected manual operations.
+- **Persistent state:** the active endpoint survives restarts.
 
-Instead of paging an engineer at 3 a.m. to run a runbook, AlwaysOn runs the runbook for you, verifies the result and leaves a complete audit trail.
+AlwaysOn decides *when* to switch and runs your hooks. It does not talk to any cloud or load balancer by itself: the hooks do.
 
-**What it is built to prevent:**
+## How it works
 
-- Long outages caused by slow human detection and response.
-- Disaster recovery plans that exist on paper but fail when needed.
-- Standby environments that silently drift away from production.
-- Failover procedures that depend on tribal knowledge.
-
----
-
-## Features
-
-| Capability | Description |
-|---|---|
-| **Automatic failure detection** | Health checks, SLO burn-rate signals and anomaly detection identify failing components without manual triage. |
-| **Environment mirroring** | Keeps standby environments in other regions continuously in sync with production (configuration, data replication status and capacity). |
-| **Automatic cross-region failover** | Shifts traffic and promotes standby resources when a region or critical dependency becomes unhealthy. |
-| **Critical service recovery** | Runs prioritized recovery playbooks (restart, reschedule, rollback, restore from backup) in dependency order. |
-| **Continuous availability monitoring** | Tracks uptime, latency and error budgets for every protected service, in every region. |
-
----
-
-## How It Works
-
-```mermaid
-flowchart LR
-    A[Monitor<br/>health · latency · errors] --> B[Detect<br/>failure confirmed]
-    B --> C[Decide<br/>policy + blast radius check]
-    C --> D[Act<br/>restart · failover · restore]
-    D --> E[Verify<br/>service healthy?]
-    E -->|yes| F[Report & audit]
-    E -->|no| C
-    M[Mirror<br/>standby environments] -.-> D
+```
+ probes (http / tcp / command)
+        │ every `interval`
+        ▼
+ ┌───────────────────────────────────────────────┐
+ │ ServiceController (one per service)           │
+ │  1. record results, apply thresholds          │
+ │  2. active unhealthy?  → failover (by priority)│
+ │     better endpoint stable? → failback        │
+ │  3. unhealthy endpoints → recovery actions    │
+ │  4. retry pending switch hooks                │
+ │  5. publish state, emit events                │
+ └───────────────────────────────────────────────┘
+        │                      │
+   on_failover hooks     state file / events log / API
 ```
 
-1. **Monitor:** probes and metrics feed a continuous view of service health.
-2. **Detect:** failures are confirmed across multiple signals to avoid false positives.
-3. **Decide:** the policy engine chooses the least disruptive action that meets the recovery objective.
-4. **Act:** the recovery executor runs the playbook, in dependency order.
-5. **Verify:** AlwaysOn confirms the service is healthy again; if not, it escalates to the next strategy or to a human.
+Service status: `starting`, `healthy` (top-priority endpoint active), `degraded` (running on a lower-priority endpoint), `outage` (active endpoint down and nowhere to go).
 
----
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.11+
-- Access credentials for your cloud provider(s) with permissions for the actions you enable
-- A secondary region or environment to act as the failover target
-
-### Installation
+## Install
 
 ```bash
-pip install alwayson
+pip install -e .
 ```
 
-Or from source:
+Or without installing: `PYTHONPATH=src python -m alwayson --help`
+
+## Quick start
 
 ```bash
-git clone https://github.com/<your-org>/alwayson.git
-cd alwayson
-pip install -e ".[dev]"
+alwayson init        # writes alwayson.json
+alwayson validate    # checks the configuration
+alwayson check       # probes every endpoint once (no side effects)
+alwayson run         # starts monitoring, recovery and failover
+alwayson status      # last published state
+alwayson events --tail 20
 ```
-
-### Run it
-
-```bash
-# 1. Scaffold a configuration
-alwayson init
-
-# 2. Validate your policies
-alwayson validate alwayson.yaml
-
-# 3. Start in dry-run mode (decisions are logged, nothing is executed)
-alwayson agent start --config alwayson.yaml --dry-run
-
-# 4. Enable autonomous mode when you are confident
-alwayson agent start --config alwayson.yaml
-```
-
----
 
 ## Configuration
 
-### Example (`alwayson.yaml`)
-
-```yaml
-regions:
-  primary: sa-east-1
-  standby: us-east-1
-
-services:
-  - id: checkout-api
-    criticality: tier-0
-    health_check:
-      type: http
-      url: https://checkout.example.com/healthz
-      interval: 10s
-      failure_threshold: 3
-    mirror:
-      enabled: true
-      target_region: us-east-1
-      max_drift: 5m
-    recovery:
-      objectives:
-        rto: 5m
-        rpo: 30s
-      steps:
-        - action: restart
-          max_attempts: 2
-        - action: failover
-          target_region: us-east-1
-          require_approval: false
-
-  - id: orders-db
-    criticality: tier-0
-    recovery:
-      steps:
-        - action: promote_replica
-        - action: restore_from_backup
-          require_approval: true
-
-policies:
-  max_concurrent_recoveries: 2
-  cooldown: 15m
+```json
+{
+  "state_file": "./.alwayson/state.json",
+  "event_log": "./.alwayson/events.jsonl",
+  "api": { "enabled": true, "host": "127.0.0.1", "port": 8480, "token_env": "ALWAYSON_TOKEN" },
+  "defaults": { "interval": 5, "timeout": 3, "failure_threshold": 3, "success_threshold": 2 },
+  "services": [
+    {
+      "name": "web",
+      "failover_delay": 0,
+      "failback": { "mode": "auto", "stable_seconds": 60 },
+      "flap_protection": { "max_switches": 5, "window_seconds": 600 },
+      "recovery": {
+        "actions": [{ "type": "command", "command": "systemctl restart web@$ALWAYSON_ENDPOINT", "timeout": 30 }],
+        "max_attempts": 3,
+        "backoff_seconds": [5, 15, 45],
+        "cooldown_seconds": 300
+      },
+      "on_failover": [
+        { "type": "command", "command": "./scripts/switch-traffic.sh", "timeout": 30 },
+        { "type": "webhook", "url": "https://hooks.example.com/alwayson", "timeout": 10 }
+      ],
+      "endpoints": [
+        { "name": "primary", "priority": 1, "address": "10.0.0.10:80",
+          "check": { "type": "http", "url": "http://10.0.0.10/healthz", "expect_status": 200 } },
+        { "name": "standby", "priority": 2, "address": "10.0.1.10:80",
+          "check": { "type": "tcp", "host": "10.0.1.10", "port": 80 } }
+      ]
+    }
+  ]
+}
 ```
 
-### Example event log (illustrative)
+Paths in `state_file` and `event_log` are relative to the configuration file.
 
-```text
-12:04:10  checkout-api   health check failed (1/3)
-12:04:30  checkout-api   health check failed (3/3) → failure confirmed
-12:04:31  policy         action selected: restart (attempt 1/2)
-12:05:02  checkout-api   restart did not restore health
-12:05:03  policy         escalating: failover → us-east-1
-12:05:41  traffic        100% shifted to us-east-1
-12:05:55  checkout-api   healthy in us-east-1 · recovery time: 1m 45s
-12:05:56  audit          incident INC-0042 closed (RTO met: 5m target)
+### Service fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | required | Letters, digits, `_`, `.`, `-`. |
+| `interval` | 5 | Seconds between probe rounds. |
+| `timeout` | 3 | Default probe timeout (seconds). |
+| `failure_threshold` | 3 | Consecutive failures before an endpoint is `unhealthy`. |
+| `success_threshold` | 2 | Consecutive successes before an endpoint is `healthy`. |
+| `failover_delay` | 0 | Seconds the active endpoint must stay down before failing over. |
+| `failback.mode` | `auto` | `auto` or `manual`. |
+| `failback.stable_seconds` | 60 | How long a better endpoint must be healthy before failing back. |
+| `flap_protection.max_switches` | 5 | Automatic switches allowed in the window before freezing. |
+| `flap_protection.window_seconds` | 600 | Size of that window. |
+| `recovery` | none | Service-wide recovery policy (an endpoint can override it with its own `recovery`). |
+| `on_failover` | `[]` | Actions run whenever the active endpoint changes. |
+| `hook_max_attempts` | 5 | Attempts for failing hooks before giving up. |
+| `hook_retry_seconds` | 10 | Delay between hook attempts. |
+
+`defaults` supplies `interval`, `timeout`, `failure_threshold` and `success_threshold` to every service.
+
+### Checks
+
+| Type | Fields |
+|------|--------|
+| `http` | `url`, `expect_status` (number or list, default 200), `expect_body` (substring), `headers`, `verify_tls` (default true), `method` (`GET`/`HEAD`), `timeout` |
+| `tcp` | `host`, `port`, `timeout` |
+| `command` | `command` (healthy when it exits 0), `timeout` |
+
+### Recovery policy
+
+`actions` (list, run in order, stops at the first failure), `max_attempts` (3), `backoff_seconds` ([5, 15, 45]), `cooldown_seconds` (300). After `max_attempts` AlwaysOn waits for the cooldown and starts over.
+
+### Action environment
+
+Commands receive these variables; webhooks receive the same data as a JSON body plus `timestamp`.
+
+| Variable | Meaning |
+|----------|---------|
+| `ALWAYSON_SERVICE` | Service name |
+| `ALWAYSON_EVENT` | `election`, `failover`, `failback`, `manual_failover` or `recovery` |
+| `ALWAYSON_FROM` / `ALWAYSON_TO` | Previous and new active endpoint (switch hooks) |
+| `ALWAYSON_ENDPOINT` | The endpoint being switched to or recovered |
+| `ALWAYSON_ADDRESS` | That endpoint's `address` |
+| `ALWAYSON_REASON` | Why the action runs |
+| `ALWAYSON_ATTEMPT` | Attempt number (recovery actions) |
+
+Switch hooks may run more than once when a later hook fails, so **make them idempotent**.
+
+## HTTP API
+
+Enabled with `"api": {"enabled": true}`. It binds to `127.0.0.1` by default.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/healthz` | none | Liveness |
+| GET | `/api/v1/status` | none | State of all services |
+| GET | `/api/v1/events?limit=100&service=web` | none | Recent events |
+| GET | `/metrics` | none | Prometheus metrics |
+| POST | `/api/v1/services/<name>/failover` | token | Body `{"to": "standby", "force": false}` |
+| POST | `/api/v1/services/<name>/freeze` | token | Pause automation for the service |
+| POST | `/api/v1/services/<name>/unfreeze` | token | Resume automation |
+
+The admin token is read from the environment variable named by `api.token_env`. Without a token the POST endpoints are disabled. Send it as `Authorization: Bearer <token>`.
+
+A manual failover pins the service: automatic failback is suppressed until the pinned endpoint fails or you switch again.
+
+## Security notes
+
+- The configuration file is trusted: commands run through the shell with the privileges of the AlwaysOn process. Restrict who can edit it and run AlwaysOn as an unprivileged user.
+- Keep the API on localhost, or put it behind a TLS-terminating reverse proxy with network controls.
+- The admin token is read only from the environment, never from the configuration file.
+
+## Limitations
+
+- A single controller process: run it under a supervisor (systemd, container restart policy). It does not replicate itself.
+- Hooks and recovery commands block that service's loop until they finish or time out.
+- Traffic switching is the responsibility of your hooks.
+- Windows is only partially supported (process-group timeouts are POSIX-only).
+
+## Tests
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
 ```
-
----
-
-## Safety Guardrails
-
-Autonomous recovery must be predictable. AlwaysOn ships with these controls:
-
-- **Dry-run mode:** see exactly what would happen before enabling execution.
-- **Approval gates:** require human approval for high-impact actions such as restores or failback.
-- **Blast-radius limits:** cap concurrent recoveries and the share of traffic that can be moved at once.
-- **Cooldowns and flap protection:** prevent repeated failover/failback loops.
-- **Full audit trail:** every signal, decision and action is recorded with its reason.
-- **Kill switch:** `alwayson agent pause` immediately stops autonomous actions.
-
----
-
-## Use Cases
-
-- **Regional outage:** automatically move critical services to a healthy region.
-- **Failed deployment or crashed workload:** restart, reschedule or roll back without a page.
-- **Database primary failure:** promote a replica and repoint dependent services.
-- **DR readiness:** keep standby environments mirrored and verify they can take traffic.
-- **Reducing MTTR:** replace manual runbooks with tested, automated playbooks.
-
----
-
-## Project Structure
-
-```text
-alwayson/
-├── src/alwayson/
-│   ├── monitor/        # Probes, metrics ingestion, health evaluation
-│   ├── detect/         # Failure confirmation and anomaly detection
-│   ├── policy/         # Decision engine, guardrails, approvals
-│   ├── recovery/       # Playbooks and action executors
-│   ├── mirror/         # Environment mirroring and drift detection
-│   ├── failover/       # Traffic shifting and replica promotion
-│   ├── audit/          # Event log and incident records
-│   └── cli.py          # Command-line interface
-├── examples/
-├── tests/
-├── docs/
-└── README.md
-```
-
----
-
-## Integrations
-
-| Integration | Purpose | Status |
-|---|---|---|
-| HTTP / TCP health checks | Service availability probing | ✅ Available |
-| Prometheus | Metrics and SLO signals | 🛠️ Planned |
-| Kubernetes | Workload restart, reschedule, rollback | 🛠️ Planned |
-| AWS / GCP / Azure | Cross-region failover and traffic shifting | 🛠️ Planned |
-| Terraform | Environment mirroring from IaC | 🛠️ Planned |
-| Slack / PagerDuty | Notifications and approvals | 🛠️ Planned |
-
----
-
-## Works Well with InfraTwin
-
-[InfraTwin](../infratwin) simulates your infrastructure so you can test changes, failures and recovery strategies before deployment. Use it to rehearse AlwaysOn policies (failover thresholds, RTO/RPO targets, playbook order) in a safe model, then promote the validated policies to production.
-
----
-
-## Roadmap
-
-- [ ] Core monitoring and failure detection
-- [ ] Policy engine with dry-run and approval gates
-- [ ] Automatic restart and replica promotion
-- [ ] Cross-region traffic failover
-- [ ] Environment mirroring with drift alerts
-- [ ] Automated failback with verification
-- [ ] Web dashboard for availability and incident history
-- [ ] Game-day mode for scheduled recovery drills
-
----
-
-## Contributing
-
-Contributions are welcome!
-
-1. Fork the repository.
-2. Create a branch: `git checkout -b feature/my-improvement`
-3. Run the tests: `pytest`
-4. Open a pull request describing the change and the reasoning behind it.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for code style and review guidelines.
-
----
 
 ## License
 
-Distributed under the MIT License. See [LICENSE](LICENSE) for details.
+**All rights reserved.** See [LICENSE](./LICENSE).
