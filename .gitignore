@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Local AlwaysOn data
+alwayson.json
+.alwayson/
